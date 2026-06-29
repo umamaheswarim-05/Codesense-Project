@@ -4,7 +4,7 @@ const router = express.Router();
 function classifyError(stderr) {
   if (!stderr) return null;
   const lower = stderr.toLowerCase();
-  if (lower.includes('syntaxerror') || lower.includes('syntax error')) return 'Syntax';
+  if (lower.includes('syntaxerror') || lower.includes('syntax error') || lower.includes('error:')) return 'Syntax';
   if (lower.includes('nameerror') || lower.includes('typeerror') ||
       lower.includes('indexerror') || lower.includes('nullpointer') ||
       lower.includes('runtimeerror')) return 'Runtime';
@@ -14,33 +14,34 @@ function classifyError(stderr) {
 function getAIExplanation(errorMessage, language) {
   if (!errorMessage) return null;
   const lower = errorMessage.toLowerCase();
-
-  if (lower.includes('nameerror') || lower.includes("is not defined")) {
-    return `You have used a variable or function name that doesn't exist. Check for spelling mistakes — for example, 'prin' should be 'print'. Make sure the variable is defined before using it.`;
+  if (lower.includes('nameerror') || lower.includes('is not defined')) {
+    return `You have used a variable or function name that doesn't exist. Check for spelling mistakes and make sure the variable is defined before using it.`;
   }
   if (lower.includes('syntaxerror') || lower.includes('syntax error')) {
-    return `Your code has a syntax error — meaning the structure of your code doesn't follow ${language} rules. Check for missing brackets, colons, or quotation marks.`;
+    return `Your code has a syntax error — the structure doesn't follow ${language} rules. Check for missing brackets, colons, or quotation marks.`;
   }
   if (lower.includes('typeerror')) {
-    return `You are trying to perform an operation on the wrong data type. For example, adding a number to a string directly won't work. Use type conversion like str() or int() where needed.`;
+    return `You are trying to perform an operation on the wrong data type. Use type conversion like str() or int() where needed.`;
   }
   if (lower.includes('indexerror')) {
-    return `You are trying to access a position in a list that doesn't exist. Check that your index is within the valid range — remember, list indexing starts at 0.`;
+    return `You are trying to access a position in a list that doesn't exist. Remember, list indexing starts at 0.`;
   }
   if (lower.includes('zerodivision')) {
-    return `You are dividing a number by zero, which is mathematically undefined. Add a check to make sure the denominator is not zero before dividing.`;
+    return `You are dividing a number by zero. Add a check to make sure the denominator is not zero before dividing.`;
   }
   if (lower.includes('nullpointer') || lower.includes('null')) {
-    return `You are trying to use an object that hasn't been initialised yet. Make sure the object is created and assigned a value before calling any methods on it.`;
+    return `You are trying to use an object that hasn't been initialised. Make sure the object is created before calling methods on it.`;
   }
   if (lower.includes('indentationerror')) {
-    return `Your code has an indentation error. Python uses spaces/tabs to define code blocks — make sure all lines inside a function or loop are consistently indented.`;
+    return `Your code has an indentation error. Make sure all lines inside a function or loop are consistently indented.`;
   }
-  return `An error occurred in your ${language} code. Read the error message carefully — it tells you the line number and type of error. Fix that line and try running again.`;
+  if (lower.includes('error:') || lower.includes('exception')) {
+    return `Your ${language} code has a compilation or runtime error. Check the line number mentioned in the error and fix the issue.`;
+  }
+  return `An error occurred in your ${language} code. Read the error message carefully — it tells you the line number and type of error.`;
 }
 
 module.exports = (pool) => {
-
   router.post('/run', async (req, res) => {
     try {
       const { code, language, userId } = req.body;
@@ -49,66 +50,68 @@ module.exports = (pool) => {
         return res.status(400).json({ error: 'Code and language are required' });
       }
 
-      let output = '';
-      let errorOutput = '';
-      let isSuccess = true;
+      const compilerMap = {
+        python: 'cpython-3.13.8',
+        javascript: 'nodejs-20.17.0',
+        java: 'openjdk-jdk-22+36',
+        cpp: 'gcc-13.2.0',
+      };
 
-      if (language === 'python') {
-        if (code.includes('prin(') || code.includes('prnt(')) {
-          errorOutput = "NameError: name 'prin' is not defined";
-          isSuccess = false;
-        } else if (code.match(/print\s*\(/)) {
-          const match = code.match(/print\(['"](.+)['"]\)/);
-          output = match ? match[1] + '\n' : 'Code executed successfully\n';
-        } else {
-          output = 'Code executed successfully\n';
-        }
-      } else if (language === 'javascript') {
-        if (code.includes('console.log')) {
-          const match = code.match(/console\.log\(['"](.+)['"]\)/);
-          output = match ? match[1] + '\n' : 'Code executed successfully\n';
-        } else {
-          output = 'Code executed successfully\n';
-        }
-      } else if (language === 'java') {
-        if (code.includes('System.out.println')) {
-          const match = code.match(/System\.out\.println\(['"](.+)['"]\)/);
-          output = match ? match[1] + '\n' : 'Code executed successfully\n';
-        } else {
-          output = 'Code executed successfully\n';
-        }
-      } else if (language === 'cpp') {
-        output = 'Code executed successfully\n';
+      const compiler = compilerMap[language];
+      if (!compiler) {
+        return res.status(400).json({ error: 'Unsupported language' });
       }
 
-      // Save execution to DB
+      // Java: replace class name with prog to match file name
+      let finalCode = code;
+      if (language === 'java') {
+        finalCode = code.replace(/public\s+class\s+\w+/g, 'public class prog');
+      }
+
+      const response = await fetch('https://wandbox.org/api/compile.json', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          compiler: compiler,
+          code: finalCode,
+          options: '',
+          stdin: '',
+          'compiler-option-raw': '',
+        }),
+      });
+
+      const result = await response.json();
+      console.log('Wandbox result:', JSON.stringify(result));
+
+      const stdout = result.program_output || '';
+      const stderr = result.compiler_error || result.program_error || '';
+      const isSuccess = result.status === '0';
+
       const execResult = await pool.query(
         `INSERT INTO executions (user_id, language, code, output, is_success)
          VALUES ($1, $2, $3, $4, $5) RETURNING exec_id`,
-        [userId || null, language, code, isSuccess ? output : errorOutput, isSuccess]
+        [userId || null, language, code, isSuccess ? stdout : stderr, isSuccess]
       );
 
       const execId = execResult.rows[0].exec_id;
-
       let errorType = null;
       let aiExplanation = null;
 
       if (!isSuccess) {
-        errorType = classifyError(errorOutput);
-        aiExplanation = getAIExplanation(errorOutput, language);
+        errorType = classifyError(stderr);
+        aiExplanation = getAIExplanation(stderr, language);
 
-        // Save error + AI explanation to DB
         await pool.query(
           `INSERT INTO errors (exec_id, error_message, error_type, ai_explanation)
            VALUES ($1, $2, $3, $4)`,
-          [execId, errorOutput, errorType, aiExplanation]
+          [execId, stderr, errorType, aiExplanation]
         );
       }
 
       res.json({
         success: isSuccess,
-        output: isSuccess ? output : null,
-        error: isSuccess ? null : errorOutput,
+        output: isSuccess ? stdout || 'Code executed successfully' : null,
+        error: isSuccess ? null : stderr,
         errorType,
         aiExplanation,
         execId,
